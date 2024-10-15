@@ -1,5 +1,5 @@
 [package]
-name = "easy_server"
+name = "easy_relay"
 version = "0.1.0"
 authors = ["Camilo <camilomcatasus@gmail.com>"]
 edition = "2021"
