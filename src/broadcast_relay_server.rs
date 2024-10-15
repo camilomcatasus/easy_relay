@@ -135,7 +135,7 @@ impl RelayServer for BroadcastRelayServer {
         tokio::spawn(async move {
             while let Some(message_wrapper) = host_receiver.recv().await {
                 if let Some(lag_ms) = config.lag_ms {
-                    if let Some(time_to_sleep) = message_wrapper.time_arrived.elapsed().checked_sub( lag_ms) {
+                    if let Some(time_to_sleep) = lag_ms.checked_sub(message_wrapper.time_arrived.elapsed()) {
                         tokio::time::sleep(time_to_sleep).await;
                     }
                 }
