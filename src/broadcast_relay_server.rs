@@ -9,11 +9,16 @@ use warp::{
 
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use std::{collections::HashMap, error::Error};
-use tokio::sync::{
-    Mutex,
-    mpsc::Sender,
-    
+use tokio::{
+    sync::{
+        mpsc::Sender, Mutex
+    }, 
+    time::{
+        Instant,
+        Duration
+    }
 };
+
 use std::sync::Arc;
 use crate::relay_server::RelayServer;
 use tungstenite::Error as TsError;
@@ -21,7 +26,7 @@ type WebSocketSinks = Arc<Mutex<Vec<SplitSink<WebSocket, Message>>>>;
 
 struct Room {
     pub client_sinks: WebSocketSinks,
-    pub host_sender: Sender<Message>,
+    pub host_sender: Sender<MessageWrapper>,
 }
 
 #[derive(Clone)]
@@ -65,6 +70,11 @@ impl BroadcastRelayServer {
     }
 }
 
+struct MessageWrapper {
+    message: Message,
+    time_arrived: Instant,
+}
+
 // TODO: Fix race condition, code is generated and returns, meanwhile another new code is generated
 // these two codes are the same, the program will attempt to add them both to the map.
 impl RelayServer for BroadcastRelayServer {
@@ -85,7 +95,7 @@ impl RelayServer for BroadcastRelayServer {
         println!("Created new room with code: {}", &code);
 
         let client_sinks: WebSocketSinks = Arc::new(Mutex::new(Vec::new()));
-        let (host_sender, mut host_receiver) = tokio::sync::mpsc::channel::<Message>(32);
+        let (host_sender, mut host_receiver) = tokio::sync::mpsc::channel::<MessageWrapper>(32);
 
         {
             let _ = self.connections.lock().await.insert(code.clone(), Room {
@@ -106,6 +116,8 @@ impl RelayServer for BroadcastRelayServer {
         let connections_clone = self.connections.clone();
         let moved_code = code.clone();
 
+        let config = self.config.clone();
+
         tokio::spawn(async move {
 
 
@@ -121,8 +133,13 @@ impl RelayServer for BroadcastRelayServer {
         });
 
         tokio::spawn(async move {
-            while let Some(message) = host_receiver.recv().await {
-                match host_sink.send(message).await {
+            while let Some(message_wrapper) = host_receiver.recv().await {
+                if let Some(lag_ms) = config.lag_ms {
+                    if let Some(time_to_sleep) = message_wrapper.time_arrived.elapsed().checked_sub( lag_ms) {
+                        tokio::time::sleep(time_to_sleep).await;
+                    }
+                }
+                match host_sink.send(message_wrapper.message).await {
                     Ok(_) => (),
                     Err(err) => {
                         println!("Error happened sending message {:?}", err);
@@ -152,10 +169,12 @@ impl RelayServer for BroadcastRelayServer {
             tokio::spawn(async move {
                 while let Some(Ok(message)) = client_stream.next().await {
 
-                    // DON'T SEND THE CLOSE MESSAGE! THE HOST THINKS THE SERVER IS CLOSING THE
-                    // CONNECTION!!!!!
                     if !message.is_close() {
-                        let _client_send_result = host_sender.send(message).await;
+                        let wrapped_messaged = MessageWrapper {
+                            message,
+                            time_arrived: Instant::now()
+                        } ;
+                        let _client_send_result = host_sender.send(wrapped_messaged).await;
                     }
 
                     if host_sender.is_closed() {
@@ -216,6 +235,7 @@ pub struct BroadcastRelayServerConfig
     pub max_rooms: u16,
     pub max_room_connections: u16,
     pub port: u16,
+    pub lag_ms: Option<Duration>,
 }
 
 impl Default for BroadcastRelayServerConfig 
@@ -224,7 +244,8 @@ impl Default for BroadcastRelayServerConfig
         BroadcastRelayServerConfig {
             max_rooms: 100,
             max_room_connections: 20,
-            port: 3030
+            port: 3030,
+            lag_ms: None
         }
     }
 }
