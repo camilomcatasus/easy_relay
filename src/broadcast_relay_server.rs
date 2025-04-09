@@ -12,11 +12,7 @@ use std::{collections::HashMap, error::Error};
 use tokio::{
     sync::{
         mpsc::Sender, Mutex
-    }, 
-    time::{
-        Instant,
-        Duration
-    }
+    },
 };
 
 use std::sync::Arc;
@@ -25,6 +21,7 @@ use tungstenite::Error as TsError;
 type WebSocketSinks = Arc<Mutex<Vec<SplitSink<WebSocket, Message>>>>;
 
 struct Room {
+    pub client_index: u16,
     pub client_sinks: WebSocketSinks,
     pub host_sender: Sender<MessageWrapper>,
 }
@@ -72,7 +69,7 @@ impl BroadcastRelayServer {
 
 struct MessageWrapper {
     message: Message,
-    time_arrived: Instant,
+    client_id: u16,
 }
 
 // TODO: Fix race condition, code is generated and returns, meanwhile another new code is generated
@@ -99,6 +96,7 @@ impl RelayServer for BroadcastRelayServer {
 
         {
             let _ = self.connections.lock().await.insert(code.clone(), Room {
+                client_index: 1u16,
                 client_sinks: client_sinks.clone(),
                 host_sender
             });
@@ -116,11 +114,7 @@ impl RelayServer for BroadcastRelayServer {
         let connections_clone = self.connections.clone();
         let moved_code = code.clone();
 
-        let config = self.config.clone();
-
         tokio::spawn(async move {
-
-
             while let Some(Ok(message)) = host_stream.next().await {
                 let mut unlocked_client_sinks = client_sinks.lock().await;
                 for client_sink in unlocked_client_sinks.iter_mut() {
@@ -134,12 +128,10 @@ impl RelayServer for BroadcastRelayServer {
 
         tokio::spawn(async move {
             while let Some(message_wrapper) = host_receiver.recv().await {
-                if let Some(lag_ms) = config.lag_ms {
-                    if let Some(time_to_sleep) = lag_ms.checked_sub(message_wrapper.time_arrived.elapsed()) {
-                        tokio::time::sleep(time_to_sleep).await;
-                    }
-                }
-                match host_sink.send(message_wrapper.message).await {
+                let mut client_message_bytes = message_wrapper.message.into_bytes();
+                client_message_bytes.append(&mut message_wrapper.client_id.to_le_bytes().to_vec());
+                let identified_message = Message::binary(client_message_bytes);
+                match host_sink.send(identified_message).await {
                     Ok(_) => (),
                     Err(err) => {
                         println!("Error happened sending message {:?}", err);
@@ -160,8 +152,13 @@ impl RelayServer for BroadcastRelayServer {
 
     async fn handle_peer_connection(&self, code: String, mut websocket: WebSocket) {
 
-        if let Some(room) = self.connections.lock().await.get(&code) {
-            let _ = websocket.send(Message::binary(vec![0b0000_1111])).await;
+        if let Some(room) = self.connections.lock().await.get_mut(&code) {
+            let client_id = room.client_index;
+            room.client_index += 1;
+
+            let mut connection_response: Vec<u8> = Vec::new();
+            connection_response.extend_from_slice(&client_id.to_le_bytes());
+            let _ = websocket.send(Message::binary(connection_response)).await;
             let (client_sink, mut client_stream) = websocket.split();
             println!("Client connected using valid code: {}", code);
             let host_sender = room.host_sender.clone();
@@ -172,7 +169,7 @@ impl RelayServer for BroadcastRelayServer {
                     if !message.is_close() {
                         let wrapped_messaged = MessageWrapper {
                             message,
-                            time_arrived: Instant::now()
+                            client_id,
                         } ;
                         let _client_send_result = host_sender.send(wrapped_messaged).await;
                     }
@@ -235,7 +232,6 @@ pub struct BroadcastRelayServerConfig
     pub max_rooms: u16,
     pub max_room_connections: u16,
     pub port: u16,
-    pub lag_ms: Option<Duration>,
 }
 
 impl Default for BroadcastRelayServerConfig 
@@ -245,7 +241,6 @@ impl Default for BroadcastRelayServerConfig
             max_rooms: 100,
             max_room_connections: 20,
             port: 3030,
-            lag_ms: None
         }
     }
 }
